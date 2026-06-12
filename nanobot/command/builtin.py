@@ -74,6 +74,34 @@ BUILTIN_COMMAND_SPECS: tuple[BuiltinCommandSpec, ...] = (
         "[n]",
     ),
     BuiltinCommandSpec(
+        "/recall",
+        "Recall memory",
+        "Search historical memory for prior conversations or audit findings.",
+        "search",
+        "<query>",
+    ),
+    BuiltinCommandSpec(
+        "/trade-record",
+        "Record trade",
+        "Record a structured trade. Usage: /trade-record {json} or key:value pairs separated by ;",
+        "plus",
+        "{json} | instrument:BTC;entry_price:123.4;exit_price:125.0;pnl:1.6",
+    ),
+    BuiltinCommandSpec(
+        "/trade-history",
+        "Trade history",
+        "Show recent trades for an instrument. Usage: /trade-history <instrument>",
+        "history",
+        "<instrument>",
+    ),
+    BuiltinCommandSpec(
+        "/trade-stats",
+        "Trade stats",
+        "Show aggregated trade stats. Usage: /trade-stats [instrument]",
+        "stats",
+        "[instrument]",
+    ),
+    BuiltinCommandSpec(
         "/goal",
         "Start long-running goal",
         "Tell the agent to treat the request as a long-running goal.",
@@ -87,6 +115,18 @@ BUILTIN_COMMAND_SPECS: tuple[BuiltinCommandSpec, ...] = (
         "sparkles",
     ),
     BuiltinCommandSpec(
+        "/self-improve",
+        "Self-improve",
+        "Run Dream memory consolidation and self-improvement.",
+        "sparkles",
+    ),
+    BuiltinCommandSpec(
+        "/self-improvement",
+        "Self-improvement",
+        "Run Dream memory consolidation and self-improvement.",
+        "sparkles",
+    ),
+    BuiltinCommandSpec(
         "/dream-log",
         "Show Dream log",
         "Show what the last Dream consolidation changed.",
@@ -97,12 +137,6 @@ BUILTIN_COMMAND_SPECS: tuple[BuiltinCommandSpec, ...] = (
         "Restore memory",
         "Revert memory to a previous Dream snapshot.",
         "undo-2",
-    ),
-    BuiltinCommandSpec(
-        "/skill",
-        "List skills",
-        "List all enabled skills available to the agent.",
-        "wrench",
     ),
     BuiltinCommandSpec(
         "/help",
@@ -129,7 +163,7 @@ async def cmd_stop(ctx: CommandContext) -> OutboundMessage:
     """Cancel all active tasks and subagents for the session."""
     loop = ctx.loop
     msg = ctx.msg
-    total = await loop._cancel_active_tasks(ctx.key)
+    total = await loop._cancel_active_tasks(msg.session_key)
     content = f"Stopped {total} task(s)." if total else "No active task to stop."
     return OutboundMessage(
         channel=msg.channel, chat_id=msg.chat_id, content=content,
@@ -212,7 +246,7 @@ async def cmd_new(ctx: CommandContext) -> OutboundMessage:
     loop.sessions.save(session)
     loop.sessions.invalidate(session.key)
     if snapshot:
-        loop._schedule_background(loop.consolidator.archive(snapshot, session_key=ctx.key))
+        loop._schedule_background(loop.consolidator.archive(snapshot))
     return OutboundMessage(
         channel=ctx.msg.channel, chat_id=ctx.msg.chat_id,
         content="New session started.",
@@ -311,59 +345,17 @@ async def cmd_dream(ctx: CommandContext) -> OutboundMessage:
     msg = ctx.msg
 
     async def _run_dream():
-        from nanobot.agent.memory import MemoryStore
-
-        dream_session_key = MemoryStore.dream_session_key
-        build_dream_commit_message = MemoryStore.build_dream_commit_message
-        prune_dream_sessions = MemoryStore.prune_dream_sessions
-
-        store = loop.context.memory
-        content = ""
-        resp = None
         t0 = time.monotonic()
         try:
-            result = store.build_dream_prompt()
-            if result is None:
-                await loop.bus.publish_outbound(OutboundMessage(
-                    channel=msg.channel, chat_id=msg.chat_id,
-                    content="Dream: nothing to process.",
-                ))
-                return
-            prompt, last_cursor = result
-            key = dream_session_key()
-            resp = await loop.process_direct(
-                prompt,
-                session_key=key,
-                ephemeral=True,
-                tools=store.build_dream_tools(),
-            )
+            did_work = await loop.dream.run()
             elapsed = time.monotonic() - t0
-            if MemoryStore.dream_run_completed(resp):
-                store.set_last_dream_cursor(last_cursor)
+            if did_work:
                 content = f"Dream completed in {elapsed:.1f}s."
             else:
-                content = (
-                    f"Dream did not complete after {elapsed:.1f}s; "
-                    "memory cursor was not advanced."
-                )
+                content = "Dream: nothing to process."
         except Exception as e:
             elapsed = time.monotonic() - t0
             content = f"Dream failed after {elapsed:.1f}s: {e}"
-        finally:
-            from nanobot.webui.token_usage import record_response_token_usage
-
-            record_response_token_usage(
-                resp,
-                source="dream",
-                timezone_name=getattr(loop.context, "timezone", None),
-            )
-            if store.git.is_initialized():
-                commit_msg = build_dream_commit_message("dream: manual run", resp)
-                sha = store.git.auto_commit(commit_msg)
-                if sha:
-                    content += f" (commit {sha})"
-            store.compact_history()
-            prune_dream_sessions(loop.sessions.sessions_dir)
         await loop.bus.publish_outbound(OutboundMessage(
             channel=msg.channel, chat_id=msg.chat_id, content=content,
         ))
@@ -602,6 +594,111 @@ async def cmd_history(ctx: CommandContext) -> OutboundMessage:
     )
 
 
+async def cmd_recall(ctx: CommandContext) -> OutboundMessage:
+    """Search historical memory for matching prior conversations."""
+    query = ctx.args.strip()
+    if not query:
+        return OutboundMessage(
+            channel=ctx.msg.channel,
+            chat_id=ctx.msg.chat_id,
+            content="Usage: /recall <query> — e.g. /recall security issue",
+            metadata={**dict(ctx.msg.metadata or {}), "render_as": "text"},
+        )
+
+    results = ctx.loop.context.memory.search_history(query, max_results=10)
+    if not results:
+        return OutboundMessage(
+            channel=ctx.msg.channel,
+            chat_id=ctx.msg.chat_id,
+            content=f"No matching memory found for `{query}`.",
+            metadata={**dict(ctx.msg.metadata or {}), "render_as": "text"},
+        )
+
+    lines = [
+        f"- [{item['timestamp']}] {truncate_text(item['content'], 300)}"
+        for item in results
+    ]
+    content = f"Recall results for `{query}`:\n" + "\n".join(lines)
+    return OutboundMessage(
+        channel=ctx.msg.channel,
+        chat_id=ctx.msg.chat_id,
+        content=content,
+        metadata={**dict(ctx.msg.metadata or {}), "render_as": "text"},
+    )
+
+
+async def cmd_trade_record(ctx: CommandContext) -> OutboundMessage:
+    """Record a structured trade into memory/trades.db.
+
+    Accepts JSON object or key:value;key:value pairs separated by `;`.
+    """
+    raw = ctx.args.strip()
+    if not raw:
+        return OutboundMessage(
+            channel=ctx.msg.channel,
+            chat_id=ctx.msg.chat_id,
+            content="Usage: /trade-record {json} or /trade-record instrument:BTC;entry_price:1.23;exit_price:1.25;pnl:0.02",
+            metadata={**dict(ctx.msg.metadata or {}), "render_as": "text"},
+        )
+
+    data: dict[str, Any] = {}
+    # JSON payload
+    if raw.startswith("{"):
+        try:
+            import json as _json
+
+            data = _json.loads(raw)
+        except Exception:
+            return OutboundMessage(channel=ctx.msg.channel, chat_id=ctx.msg.chat_id, content="Invalid JSON", metadata={**dict(ctx.msg.metadata or {}), "render_as": "text"})
+    else:
+        # parse key:value;key:value
+        parts = [p.strip() for p in raw.split(";") if p.strip()]
+        for p in parts:
+            if ":" in p:
+                k, v = p.split(":", 1)
+                data[k.strip()] = v.strip()
+
+    # normalize numeric fields
+    for key in ("entry_price", "exit_price", "pnl", "size"):
+        if key in data:
+            try:
+                data[key] = float(data[key])
+            except Exception:
+                pass
+
+    # timestamp default
+    if "ts" not in data:
+        data["ts"] = datetime.now().strftime("%Y-%m-%d %H:%M")
+
+    # record
+    tid = ctx.loop.context.memory.record_trade({**data, "session_key": ctx.key})
+    if tid < 0:
+        content = "Failed to record trade"
+    else:
+        content = f"Recorded trade id={tid} for {data.get('instrument','unknown')}"
+    return OutboundMessage(channel=ctx.msg.channel, chat_id=ctx.msg.chat_id, content=content, metadata={**dict(ctx.msg.metadata or {}), "render_as": "text"})
+
+
+async def cmd_trade_history(ctx: CommandContext) -> OutboundMessage:
+    """Show recent trades for an instrument."""
+    query = ctx.args.strip()
+    instrument = query if query else None
+    results = ctx.loop.context.memory.search_trades(instrument=instrument, max_results=20)
+    if not results:
+        return OutboundMessage(channel=ctx.msg.channel, chat_id=ctx.msg.chat_id, content="No trades found.", metadata={**dict(ctx.msg.metadata or {}), "render_as": "text"})
+    lines = [f"- [{r['ts']}] {r['instrument']} {r.get('direction','')} pnl={r.get('pnl')}" for r in results]
+    return OutboundMessage(channel=ctx.msg.channel, chat_id=ctx.msg.chat_id, content=("Recent trades:\n" + "\n".join(lines)), metadata={**dict(ctx.msg.metadata or {}), "render_as": "text"})
+
+
+async def cmd_trade_stats(ctx: CommandContext) -> OutboundMessage:
+    """Return aggregated trade stats for an instrument or overall."""
+    query = ctx.args.strip()
+    instrument = query if query else None
+    stats = ctx.loop.context.memory.trade_stats(instrument=instrument)
+    content = f"Trades: {stats.get('count',0)}  Sum PnL: {stats.get('sum_pnl',0):.4f}  Avg PnL: {stats.get('avg_pnl',0):.4f}"
+    return OutboundMessage(channel=ctx.msg.channel, chat_id=ctx.msg.chat_id, content=content, metadata={**dict(ctx.msg.metadata or {}), "render_as": "text"})
+
+
 _GOAL_PROMPT_TEMPLATE = """The user declared a sustained objective for this thread.
 
 Inspect or clarify if needed, then call `long_task` with the refined objective (and optional short ui_summary). Work proceeds as normal assistant turns using your usual tools. When the objective is fully done and verified, call `complete_goal` with a brief recap. If the user later cancels or changes direction, still call `complete_goal` with an honest recap (then `long_task` again only after there is no active goal). Do not use `long_task` / `complete_goal` for trivial one-shot answers.
@@ -655,25 +752,6 @@ async def cmd_pairing(ctx: CommandContext) -> OutboundMessage:
     )
 
 
-async def cmd_skill(ctx: CommandContext) -> OutboundMessage:
-    """List all enabled skills (name and description only)."""
-    loop = ctx.loop
-    skills = loop.context.skills.list_skills(filter_unavailable=False)
-    if not skills:
-        content = "No skills available."
-    else:
-        lines = [f"Available skills ({len(skills)}):", ""]
-        for entry in skills:
-            desc = loop.context.skills._get_skill_description(entry["name"])
-            lines.append(f"- **{entry['name']}** — {desc}")
-        content = "\n".join(lines)
-    return OutboundMessage(
-        channel=ctx.msg.channel,
-        chat_id=ctx.msg.chat_id,
-        content=content,
-        metadata=dict(ctx.msg.metadata or {}),
-    )
-
 async def cmd_help(ctx: CommandContext) -> OutboundMessage:
     """Return available slash commands."""
     return OutboundMessage(
@@ -706,14 +784,25 @@ def register_builtin_commands(router: CommandRouter) -> None:
     router.prefix("/model ", cmd_model)
     router.exact("/history", cmd_history)
     router.prefix("/history ", cmd_history)
+    router.exact("/trade-record", cmd_trade_record)
+    router.prefix("/trade-record ", cmd_trade_record)
+    router.exact("/trade-history", cmd_trade_history)
+    router.prefix("/trade-history ", cmd_trade_history)
+    router.exact("/trade-stats", cmd_trade_stats)
+    router.prefix("/trade-stats ", cmd_trade_stats)
+    router.exact("/recall", cmd_recall)
+    router.prefix("/recall ", cmd_recall)
+    router.exact("/remember", cmd_recall)
+    router.prefix("/remember ", cmd_recall)
     router.exact("/goal", cmd_goal)
     router.prefix("/goal ", cmd_goal)
     router.exact("/dream", cmd_dream)
+    router.exact("/self-improve", cmd_dream)
+    router.exact("/self-improvement", cmd_dream)
     router.exact("/dream-log", cmd_dream_log)
     router.prefix("/dream-log ", cmd_dream_log)
     router.exact("/dream-restore", cmd_dream_restore)
     router.prefix("/dream-restore ", cmd_dream_restore)
-    router.exact("/skill", cmd_skill)
     router.exact("/help", cmd_help)
     router.exact("/pairing", cmd_pairing)
     router.prefix("/pairing ", cmd_pairing)
